@@ -6,10 +6,9 @@ SPDX-License-Identifier: ISC
 
 # sockfetch
 
-A synchronous TCP socket for wasm guests, backed by `fetch()`. Real HTTP
-clients — busybox `wget`, PHP's own `http://` wrapper, `fsockopen()` — work
-**unmodified**, against any origin that allows CORS. No relay, no server, no
-Asyncify, no JSPI.
+A TCP socket for wasm guests, backed by `fetch()`. Real HTTP clients — busybox
+`wget`, PHP's own `http://` wrapper, `fsockopen()` — work **unmodified**,
+against any origin that allows CORS. No relay and no server.
 
 The guest writes an HTTP/1.1 request into what it believes is a socket. This
 package parses those bytes, performs a real `fetch()`, and writes the response
@@ -23,7 +22,8 @@ adapter    (sockfetch/websocket for Emscripten · sockfetch/wasi for WASI)
    ▼
 core       connection table · HTTP/1.1 codec · policy
    ▼
-backend    Atomics.wait + fetcher worker  →  fetch()
+backend    await fetch() on this thread     ← a guest that can suspend
+           Atomics.wait + fetcher worker    ← a guest that cannot
 ```
 
 **Only HTTP crosses the boundary**, because `fetch` is the only way out of a
@@ -32,18 +32,36 @@ plaintext and the host does the TLS, which is what the section below is about.
 What cannot exist here is anything that is not HTTP: no SSH, no MySQL, no raw
 TCP, and no amount of work will add them.
 
-## Why it needs no stack switching
+## Two doors, and how a guest picks one
 
-The guest cannot yield: it calls `recv(2)` and expects bytes before the call
-returns, with no event loop turn available in between. That is the problem
-Asyncify and JSPI exist to solve, and this package sidesteps it twice over.
+The hard part is that a guest calls `recv(2)` and expects bytes before the call
+returns. Whether that is a problem depends entirely on whether its runtime can
+suspend, so there are two ways through and the core is the same either way.
 
-HTTP is strictly **write-then-read**, so by the time a guest blocks on a
-response its request is already complete — nothing has to be sent until the
-guest reads, and the bytes can be handed over inside that read. Where a real
-wait is needed, `Atomics.wait` parks the guest's thread while another thread
-awaits the fetch. Neither end may be a browser's main thread; `Atomics.wait`
-throws there.
+**A guest that can suspend** — one whose runtime has JSPI, reached through a
+shim that uses it — awaits the fetch on its own thread. `createDirectBackend()`
+is that door: no worker, no `SharedArrayBuffer`, no cross-origin isolation, and
+no fixed window to copy a body in and out of. The event loop under the guest
+keeps turning, so everything else that thread answers is still answered during a
+download.
+
+**A guest that cannot** — an Emscripten program, whose socket layer is
+synchronous to its bones — parks in `Atomics.wait` while a worker does the
+awaiting. `createAtomicsBackend()` is that door. Neither end may be a browser's
+main thread; `Atomics.wait` throws there.
+
+Measured against the same 3 MiB body over loopback: 709 MiB/s awaited against
+456 MiB/s parked, and — the difference that actually matters — **2 event-loop
+turns during the download against 0**. A parked thread answers nothing.
+
+Both doors also lean on the same fact about HTTP: it is strictly
+**write-then-read**, so nothing has to go out until the guest reads. A request
+is queued by `send` and sent by the `recv` that wants its answer, which is the
+only place either door could have waited.
+
+`createAtomicsBackend()` offers both — `fetch` and `fetchAsync` — so a session
+with one guest of each kind shares a single connection table and a single
+policy, rather than running two nets that happen to agree.
 
 ## Using it
 
@@ -67,6 +85,19 @@ is thinner still, because there is no WebSocket to imitate:
 import { wasiNet } from 'sockfetch/wasi';
 
 await run({ net: wasiNet(net), args: ['wget', '-q', '-O', '-', url] });
+```
+
+Where the runtime has JSPI, that port also carries `recvAsync`, and a shim that
+finds it suspends the guest instead of parking its thread. Its **absence** is
+the signal — nothing has to be configured, and a shim written against it serves
+a session with JSPI and a session without. A net with only the awaited door
+needs no worker at all:
+
+```js
+import { createNet, createDirectBackend } from 'sockfetch';
+import { wasiNet } from 'sockfetch/wasi';
+
+const net = wasiNet(createNet({ backend: createDirectBackend() }));
 ```
 
 `createNet({ backend, policy })` is the core. `createPolicy()` decides the
@@ -150,6 +181,9 @@ before the socket is built. A WASI guest has no resolver to begin with, so
 
 ## Bundlers
 
+Only `createAtomicsBackend()` has this problem, and a guest that can suspend
+avoids it entirely by needing no worker.
+
 The fetcher is loaded as `new URL('./fetcher.worker.mjs', import.meta.url)`,
 which a bundler will not follow — it emits no worker file and the URL points at
 nothing. Build it as its own entry point and say where it went:
@@ -157,6 +191,11 @@ nothing. Build it as its own entry point and say where it went:
 ```js
 await createAtomicsBackend({ workerUrl: new URL('./fetcher.worker.js', import.meta.url) });
 ```
+
+Getting it wrong is a rejected promise rather than a mystery: the fetcher
+announces itself before it parks, and `createAtomicsBackend()` does not resolve
+until it has. It used to be a guest that waited for ever on a thread that never
+loaded.
 
 ## Tests
 

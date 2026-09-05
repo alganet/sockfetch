@@ -17,5 +17,7 @@
 export { createNet, AGAIN, SockError } from './core.mjs';
 export { createPolicy } from './policy.mjs';
 export { createAtomicsBackend } from './backend-atomics.mjs';
+export { createDirectBackend } from './backend-direct.mjs';
+export { beginExchange, DEFAULT_THRESHOLD } from './exchange.mjs';
 export { createRequestParser, serializeHead, redirectHead, reasonFor } from './codec.mjs';
 export { createChannel, reader, writer, DEFAULT_CHUNK } from './channel.mjs';

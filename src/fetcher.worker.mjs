@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: ISC
 
-// The thread that is allowed to await.
+// The thread that is allowed to await, for a guest that cannot.
 //
 // It parks in `Atomics.wait` when idle, wakes on a request, and does an
 // ordinary `await fetch(...)` — which works precisely because nothing else is
@@ -10,10 +10,14 @@
 // on the other channel, which is what makes a synchronous recv(2) possible at
 // all.
 //
+// What it decides about a request is not in here: see exchange.mjs, which the
+// other door shares. What IS in here is the marshalling — a head as JSON, a
+// body as chunks through a fixed window — and the guarantee below.
+//
 // ## Why nothing in here may throw
 //
 // The guest is in `Atomics.wait` on a message this thread owes it, and every
-// deadline in the package runs HERE. So an exception that escapes this loop is
+// deadline on this path runs HERE. So an exception that escapes this loop is
 // not an error the guest hears about — it is a thread that stops existing while
 // something waits on it for ever, with no timer left anywhere that could end
 // the wait. Measured, before the guard below: a dead fetcher is a guest parked
@@ -25,19 +29,10 @@
 // that was cut short, which is what a close-delimited body IS on a real socket.
 
 import { reader, writer, READY } from './channel.mjs';
+import { beginExchange, DEFAULT_THRESHOLD } from './exchange.mjs';
 
 const ENC = new TextEncoder();
 const DEC = new TextDecoder();
-
-/**
- * How much body to hold before giving up on knowing its length.
- *
- * Under it, the whole body is in hand when the head is written, so an accurate
- * `Content-Length` can go out and wget draws a progress bar. Over it, the head
- * goes out without one and the body is close-delimited — correct either way,
- * and this is the only thing the threshold decides.
- */
-const DEFAULT_THRESHOLD = 2 << 20;
 
 async function serve({ up, down, threshold = DEFAULT_THRESHOLD }) {
   const requests = reader(up);
@@ -55,95 +50,27 @@ async function serve({ up, down, threshold = DEFAULT_THRESHOLD }) {
       refuse(responses, 'ECONNRESET', e);
       continue;
     }
-    await handle(request, body, responses, threshold);
+    await handle({ ...request, body, threshold }, responses);
   }
 }
 
 /** One request, and no way for it to end without a reply. */
-async function handle(request, body, out, threshold) {
-  const { method, url, headers, credentials, timeout } = request;
-
-  // A deadline on SILENCE, not on the exchange.
-  //
-  // It starts on the wait for headers, and from then on it is re-armed by every
-  // chunk that arrives — so a large download over a slow link is never cut off
-  // for taking its time, and a stream that simply stops does not park the guest
-  // for ever. Before it was re-armed, the clock was cleared once headers landed
-  // and a body that died mid-flight had nothing left to end it.
-  const clock = timeout > 0 ? new AbortController() : null;
-  let alarm = null;
-  const arm = () => {
-    if (!clock) return;
-    if (alarm !== null) clearTimeout(alarm);
-    alarm = setTimeout(() => clock.abort(), timeout);
-  };
-  const disarm = () => { if (alarm !== null) clearTimeout(alarm); alarm = null; };
-
+async function handle(request, out) {
   let answered = false;
+  let exchange = null;
   try {
-    arm();
-    let res;
-    try {
-      res = await fetch(url, {
-        signal: clock ? clock.signal : undefined,
-        method,
-        headers,
-        // A body is only legal on some methods, and passing an empty one to GET
-        // makes fetch throw rather than ignore it.
-        body: body.length ? body : undefined,
-        credentials,
-        // `manual` would hand back an opaque response with no status and no
-        // headers, which is worse than useless here — see codec.redirectHead for
-        // what we do with `redirected` instead.
-        redirect: 'follow',
-        // The guest has its own ideas about caching and no way to express them
-        // through here; a shared HTTP cache under it would make them wrong.
-        cache: 'no-store',
-        referrerPolicy: 'no-referrer',
-      });
-    } catch (e) {
-      // Everything arrives here identically: a CORS refusal, a DNS failure, a
-      // port nothing HTTP is listening on. The browser deliberately does not say
-      // which, so neither can we — and a connection that could not be made is
-      // the honest reading of all three.
-      refuse(out, 'ECONNREFUSED', e);
-      return;
-    }
+    exchange = await beginExchange(request);
 
-    // A redirect the guest asked to hear about. The body is discarded on purpose:
-    // it belongs to the URL the guest has not agreed to fetch yet.
-    if (res.redirected && (method === 'GET' || method === 'HEAD')) {
-      out.write(ENC.encode(JSON.stringify({ redirected: true, location: res.url })));
+    if (exchange.error) { refuse(out, exchange.error, exchange); return; }
+    if (exchange.redirected) {
+      out.write(ENC.encode(JSON.stringify({ redirected: true, location: exchange.location })));
       answered = true;
       out.end();
-      try { await res.body?.cancel(); } catch { /* already done with it */ }
       return;
     }
 
-    const entries = [];
-    res.headers.forEach((value, name) => entries.push([name, value]));
-
-    const stream = res.body?.getReader();
-    const held = [];
-    let total = 0;
-    let complete = false;
-
-    while (stream && total <= threshold) {
-      const { value, done } = await stream.read();
-      arm();
-      if (done) { complete = true; break; }
-      held.push(value);
-      total += value.length;
-    }
-    if (!stream) complete = true;
-
-    out.write(ENC.encode(JSON.stringify({
-      status: res.status,
-      statusText: res.statusText,
-      headers: entries,
-      url: res.url,
-      contentLength: complete ? total : null,
-    })));
+    const { head, held, stream, complete, arm } = exchange;
+    out.write(ENC.encode(JSON.stringify(head)));
     answered = true;
 
     // Every path below ends the message, the cut-short ones included: the guest
@@ -175,7 +102,7 @@ async function handle(request, body, out, threshold) {
       refuse(out, 'ECONNRESET', e);
     }
   } finally {
-    disarm();
+    exchange?.disarm?.();
   }
 }
 

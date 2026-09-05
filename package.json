@@ -11,6 +11,8 @@
     "./policy": "./src/policy.mjs",
     "./channel": "./src/channel.mjs",
     "./atomics": "./src/backend-atomics.mjs",
+    "./direct": "./src/backend-direct.mjs",
+    "./exchange": "./src/exchange.mjs",
     "./websocket": "./src/websocket.mjs",
     "./wasi": "./src/wasi.mjs",
     "./fetcher.worker.mjs": "./src/fetcher.worker.mjs",

@@ -12,6 +12,7 @@
 // this side.
 
 import { createChannel, reader, writer, DEFAULT_CHUNK, READY } from './channel.mjs';
+import { fetchDirect } from './backend-direct.mjs';
 
 const ENC = new TextEncoder();
 const DEC = new TextDecoder();
@@ -153,6 +154,17 @@ export async function createAtomicsBackend(options = {}) {
         },
       };
     },
+
+    /**
+     * The same network, for a caller that can await it.
+     *
+     * Both doors on one backend, so a session with a suspending guest and a
+     * synchronous one shares a connection table and a policy rather than
+     * running two nets that happen to agree. Nothing here goes near the worker:
+     * a caller that can await has no use for a second thread to await on, and
+     * the fetch happens where it was asked for.
+     */
+    fetchAsync(request) { return fetchDirect(request, options.threshold); },
 
     /** Shut the fetcher down. */
     close() {
