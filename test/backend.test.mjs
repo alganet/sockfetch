@@ -90,6 +90,16 @@ test('a redirect is handed over rather than followed for the guest', { timeout: 
   assert.equal(body.length, 0);
 });
 
+test('a redirect on a POST is followed, not handed back', { timeout: 20000 }, () => {
+  // The fetcher only synthesizes a 302 for GET and HEAD. On anything else it
+  // follows, because a made-up 302 would turn the retry into a GET whatever
+  // the real chain did.
+  const { head, body } = split(exchange('/redirect', { method: 'POST', body: 'x' }).raw);
+  assert.match(head, /^HTTP\/1\.1 200 OK/);
+  assert.doesNotMatch(head, /Location:/);
+  assert.equal(body.toString(), 'hello world');
+});
+
 test('a 404 is a 404, with its body', { timeout: 20000 }, () => {
   const { head, body } = split(exchange('/missing').raw);
   assert.match(head, /^HTTP\/1\.1 404 Not Found\r\n/);

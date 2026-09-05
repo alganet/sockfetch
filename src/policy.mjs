@@ -74,11 +74,13 @@ const IPV4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
  *   (a CORS proxy); applied after `allow`
  * @param {(hostname: string) => string|null} [options.resolve] supply the
  *   address for a name; `null` falls through to the alias allocator
+ * @param {(port: number) => string} [options.scheme] decide http vs https for
+ *   a port. Only needed for a non-standard one — see `schemeFor`.
  * @param {boolean} [options.credentials] send cookies and auth. Off, and it
  *   should stay off: the guest is not the browser's user.
  */
 export function createPolicy(options = {}) {
-  const { allow, rewrite, resolve } = options;
+  const { allow, rewrite, resolve, scheme } = options;
   const credentials = options.credentials ? 'include' : 'omit';
 
   // Both directions of the alias map. `names` is what makes a connect() to an
@@ -95,11 +97,19 @@ export function createPolicy(options = {}) {
      *
      * 443 is https and everything else is http, which is not a guess about the
      * origin so much as a statement about the guest: it speaks plaintext
-     * always (its TLS is bypassed — see the phasm transport shim and busybox's
+     * always (its TLS is bypassed — see phasm's transport shim and busybox's
      * FEATURE_WGET_HTTPS staying off), so the port is the ONLY thing left that
-     * says which scheme was meant.
+     * says which scheme was meant. The guest asked for `ssl://host:443`, and
+     * the 443 is all that survives the trip down to a socket.
+     *
+     * Which means a non-standard HTTPS port is the one case this cannot read:
+     * `https://example.org:8443/` arrives as 8443 and would go out plaintext.
+     * There is nothing left in the request to tell it apart from an ordinary
+     * `http://example.org:8443/`, so it is the embedder's to say, and that is
+     * what the `scheme` option is for.
      */
     schemeFor(port) {
+      if (scheme) return scheme(port);
       return port === 443 ? 'https' : 'http';
     },
 

@@ -73,9 +73,15 @@ top of that would encrypt a function call to itself, and satisfying one means
 writing a TLS server in JavaScript.
 
 So the guest speaks **plaintext** and the scheme comes from the port: 443
-becomes `https` when the fetch is made. Making a guest stop speaking TLS is the
-one part that is per-guest work — phasm re-points PHP's `ssl://` transport at a
-plain socket, busybox is built without `FEATURE_WGET_HTTPS`.
+becomes `https` when the fetch is made, and the host does a real handshake
+against a real trust store. Making a guest stop speaking TLS is the one part
+that is per-guest work — phasm re-points PHP's `ssl://` transport at a plain
+socket, busybox is built without `FEATURE_WGET_HTTPS`.
+
+The port is all there is to go on, so a **non-standard HTTPS port** is the one
+case this cannot read on its own: `https://example.org:8443/` arrives as 8443
+and is indistinguishable from plain `http://example.org:8443/`. Pass
+`createPolicy({ scheme })` when that matters.
 
 The cost: the guest cannot verify certificates (the host does), and anything
 promising otherwise — a pinned fingerprint, a private CA — is inert and should

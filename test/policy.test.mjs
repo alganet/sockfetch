@@ -39,6 +39,15 @@ test('the port is what picks the scheme, because the guest speaks plaintext', ()
     'http://example.test:8080/a');
 });
 
+test('a non-standard https port is the embedder\'s to declare', () => {
+  // Nothing in the request distinguishes https://h:8443 from http://h:8443 by
+  // the time it reaches a socket, so the default reads 8443 as plaintext and
+  // an embedder that knows better says so.
+  assert.equal(createPolicy().urlFor({ host: 'h.test', port: 8443, target: '/a' }).protocol, 'http:');
+  const p = createPolicy({ scheme: (port) => (port === 8443 ? 'https' : 'http') });
+  assert.equal(p.urlFor({ host: 'h.test', port: 8443, target: '/a' }).href, 'https://h.test:8443/a');
+});
+
 test('a Host header carrying its own port is authoritative', () => {
   const p = createPolicy();
   assert.equal(p.urlFor({ host: 'example.test:9000', port: 9000, target: '/a' }).href,

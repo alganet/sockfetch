@@ -94,6 +94,22 @@ test('a redirect reaches the guest as a 302 it can act on', () => {
   assert.doesNotMatch(text, /whl\r\n\r\n./, 'the body of the redirect target is not smuggled in');
 });
 
+test('a redirected POST is followed for the guest, not handed back', () => {
+  // The other half of the redirect rule. A synthesized 302 tells the guest to
+  // re-request somewhere, and every client re-requests a 302 as a GET — so on
+  // a POST that would silently change the method when the real chain (a 307,
+  // say) preserved it. The decision is the fetcher's, since that is where the
+  // method is known; a POST therefore never arrives here marked `redirected`,
+  // and what comes back is the followed response.
+  const backend = stub({ status: 201, headers: [], body: ['made'] });
+  const net = createNet({ backend });
+  const fd = net.connect(net.resolve('h.test'), 80);
+  net.send(fd, enc('POST /x HTTP/1.1\r\nHost: h.test\r\nContent-Length: 2\r\n\r\nhi'));
+  const { text } = drain(net, fd);
+  assert.match(text, /^HTTP\/1\.1 201 Created/);
+  assert.doesNotMatch(text, /302/);
+});
+
 test('a fetch that could not happen is a connection reset, not a fake 502', () => {
   const net = createNet({ backend: stub({ error: 'ECONNREFUSED', message: 'CORS' }) });
   const fd = net.connect(net.resolve('packagist.test'), 443);
