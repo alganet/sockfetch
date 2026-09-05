@@ -11,7 +11,7 @@
 // Both get there the same way — a worker that awaits, and `Atomics.wait` on
 // this side.
 
-import { createChannel, reader, writer, DEFAULT_CHUNK } from './channel.mjs';
+import { createChannel, reader, writer, DEFAULT_CHUNK, READY } from './channel.mjs';
 
 const ENC = new TextEncoder();
 const DEC = new TextDecoder();
@@ -51,12 +51,49 @@ export async function createAtomicsBackend(options = {}) {
   if (isNode) {
     const { Worker } = await import('node:worker_threads');
     worker = new Worker(url, { workerData: payload });
-    // Otherwise a process with nothing left to do still waits for a thread
-    // that is parked in Atomics.wait for ever.
-    worker.unref();
   } else {
     worker = new Worker(url, { type: 'module' });
     worker.postMessage(payload);
+  }
+
+  // Nothing may park on this fetcher until it says it exists.
+  //
+  // The failure this closes is the one the README warns about and could not
+  // detect: a `workerUrl` a bundler rewrote points at nothing, the Worker
+  // constructor succeeds anyway, and the FIRST request parks a guest on a
+  // thread that never loaded — with no deadline on that side, because every
+  // deadline in this package runs on the thread that is missing.
+  //
+  // Setup is the only place that can wait, and it is already async. So this is
+  // where the difference between "parked and ready" and "never started" is
+  // resolved, once, into a promise a caller can catch — which is exactly the
+  // shape an embedder needs to say "no network this session" instead of hanging.
+  await started(worker);
+
+  // After the handshake, never before it: an unref'd worker does not hold the
+  // event loop open, so unreffing first is a process that exits while it is
+  // still waiting to hear that its fetcher came up. The reason it is wanted at
+  // all is the other end of the same fact — a process with nothing left to do
+  // should not wait on a thread parked in Atomics.wait for ever.
+  if (isNode) worker.unref();
+
+  // A fetcher that ends after that is a fetcher nothing can wait on either.
+  // It should be impossible — the loop answers its own exceptions now — so
+  // this is here for the ways a thread can end that no `catch` covers:
+  // terminate(), an out-of-memory, an engine that gave up.
+  //
+  // It cannot wake a guest that is ALREADY parked: this handler runs on the
+  // event loop of the thread that would have to run it, and that thread is the
+  // one in Atomics.wait. What it can do is refuse the next call instead of
+  // swallowing it, so a session that lost its fetcher reports connection
+  // failures rather than freezing one command at a time.
+  let dead = null;
+  const died = (why) => { dead = dead || why; };
+  if (isNode) {
+    worker.on('error', (e) => died((e && e.message) || String(e)));
+    worker.on('exit', (code) => died(`the fetcher thread exited (${code})`));
+  } else {
+    worker.addEventListener('error', (e) => died((e && e.message) || 'the fetcher thread failed'));
   }
 
   const out = writer(up);
@@ -70,6 +107,9 @@ export async function createAtomicsBackend(options = {}) {
      *          body?: Uint8Array, credentials?: string}} request
      */
     fetch(request) {
+      // Answered rather than attempted: writing into a channel whose reader is
+      // gone succeeds, and the read that follows it never returns.
+      if (dead) return { error: 'ECONNREFUSED', message: `sockfetch: ${dead}`, read: () => null, cancel() {} };
       out.write(ENC.encode(JSON.stringify({
         method: request.method,
         url: String(request.url),
@@ -116,8 +156,36 @@ export async function createAtomicsBackend(options = {}) {
 
     /** Shut the fetcher down. */
     close() {
+      dead = dead || 'the fetcher was closed';
       back.cancel();
       return worker.terminate();
     },
   };
+}
+
+/**
+ * Resolve when the fetcher is serving, reject if it failed to get there.
+ *
+ * The fetcher posts {@link READY} synchronously, immediately before its first
+ * `Atomics.wait` — so receiving it means the module loaded, took its channels
+ * and is parked on them. There is no timeout here on purpose: a worker that
+ * cannot start ends in `error` or `exit`, both of which are listened for, and
+ * inventing a deadline would only turn a slow first load into a false negative.
+ */
+function started(worker) {
+  return new Promise((resolve, reject) => {
+    const fail = (e) => reject(new Error(
+      `sockfetch: the fetcher did not start (${(e && e.message) || e}). `
+      + 'A bundler that did not emit the worker is the usual cause — see '
+      + 'createAtomicsBackend({ workerUrl }).',
+    ));
+    if (typeof worker.on === 'function') {
+      worker.on('message', (m) => { if (m === READY) resolve(); });
+      worker.on('error', fail);
+      worker.on('exit', (code) => fail(`the fetcher thread exited (${code}) before it was ready`));
+    } else {
+      worker.addEventListener('message', (e) => { if (e.data === READY) resolve(); });
+      worker.addEventListener('error', fail);
+    }
+  });
 }

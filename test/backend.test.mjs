@@ -175,3 +175,85 @@ test('walking away mid-body does not strand the fetcher', { timeout: 30000 }, ()
   // be parked in Atomics.wait for a reader that never came.
   assert.match(split(exchange('/small').raw).body.toString(), /hello world/);
 });
+
+// ---------------------------------------------------------------------------
+// The fetcher's own survival.
+//
+// Every deadline in this package runs on the fetcher's thread, and the guest is
+// parked in `Atomics.wait` on a message that thread owes it. So a fetcher that
+// ends is not an error the guest hears about — it is an indefinite wait with
+// nothing left anywhere that could end it. These are the ways it used to end.
+// ---------------------------------------------------------------------------
+
+test('a body cut short before the head went out is a reset, not a dead thread', { timeout: 30000 }, () => {
+  // Under the threshold, so the failure is still reportable as one. `fetch`
+  // resolves on the headers and rejects the body read with `TypeError:
+  // terminated`; that exception escaped the loop and took the thread with it.
+  const fd = net.connect(net.resolve('127.0.0.1'), port);
+  net.send(fd, enc(`GET /truncated HTTP/1.1\r\nHost: ${origin}\r\n\r\n`));
+  assert.throws(() => net.recv(fd, 1 << 16), (e) => e instanceof SockError && e.code === 'ECONNRESET');
+  net.close(fd);
+
+  // The proof, and the only one that matters: the thread is still there.
+  assert.match(split(exchange('/small').raw).body.toString(), /hello world/);
+});
+
+test('a body cut short after the head went out ends, and the fetcher lives', { timeout: 40000 }, () => {
+  // Past the threshold the head is already at the guest, so there is no second
+  // head to send — only the end of a body that stopped early, which is exactly
+  // what a close-delimited body looks like when a real connection drops.
+  const { head, body } = split(exchange('/truncated-big').raw);
+  assert.match(head, /^HTTP\/1\.1 200 OK\r\n/);
+  assert.doesNotMatch(head, /Content-Length/, 'it streamed, so no length was claimed');
+  assert.ok(body.length >= BIG, 'everything that did arrive was handed over');
+
+  assert.match(split(exchange('/small').raw).body.toString(), /hello world/);
+});
+
+test('a body that stops mid-stream is ended by the deadline, not waited on', { timeout: 40000 }, () => {
+  // The download gets going, the head is delivered, and then the origin simply
+  // stops — no reset, connection held open. The old clock covered the wait for
+  // headers and was cleared the moment they arrived, so from there on nothing
+  // anywhere was running that could end this; the guest parked for good.
+  //
+  // Re-armed per chunk, silence is what ends it, and a link that is merely slow
+  // — which keeps producing chunks — is still never cut off. What the guest
+  // gets is a short close-delimited body, the same thing a real socket shows.
+  const stalling = createNet({ backend, policy: createPolicy({ timeout: 500 }) });
+  const fd = stalling.connect(stalling.resolve('127.0.0.1'), port);
+  stalling.send(fd, enc(`GET /stall HTTP/1.1\r\nHost: ${origin}\r\n\r\n`));
+  let total = 0;
+  for (;;) {
+    const got = stalling.recv(fd, 1 << 16);
+    if (got.length === 0) break;
+    total += got.length;
+  }
+  stalling.close(fd);
+  assert.ok(total > BIG, 'the head and everything that did arrive were handed over');
+
+  assert.match(split(exchange('/small').raw).body.toString(), /hello world/);
+});
+
+test('a fetcher that never started is a rejection, not a guest parked for ever', { timeout: 20000 }, async () => {
+  // The mistake this package's own README warns about: a bundler that did not
+  // emit the worker leaves `workerUrl` pointing at nothing. The Worker
+  // constructor succeeds anyway, and the first request used to park a guest on
+  // a thread that never loaded. Setup is the only place that can wait, so it is
+  // where the difference is resolved.
+  await assert.rejects(
+    () => createAtomicsBackend({ workerUrl: new URL('./no-such-fetcher.mjs', import.meta.url) }),
+    (e) => /the fetcher did not start/.test(e.message) && /workerUrl/.test(e.message),
+  );
+});
+
+test('a backend whose fetcher is gone refuses instead of parking', { timeout: 20000 }, async () => {
+  // Writing into a channel whose reader has gone SUCCEEDS — the write lands in
+  // shared memory and nobody ever takes it — so it is the read that follows
+  // which never returns. Measured before this: four seconds with no answer and
+  // no error, which is the whole session.
+  const doomed = await createAtomicsBackend();
+  await doomed.close();
+  const head = doomed.fetch({ method: 'GET', url: 'http://127.0.0.1:1/', headers: [], timeout: 1000 });
+  assert.equal(head.error, 'ECONNREFUSED');
+  assert.equal(head.read(), null, 'and it is a whole response: a head AND a body');
+});

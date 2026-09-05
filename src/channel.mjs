@@ -27,6 +27,16 @@ const CANCEL = 3;  // the reader has gone; the writer must stop
 
 export const DEFAULT_CHUNK = 1 << 20;
 
+/**
+ * What the reading thread says once it has its end and is about to park.
+ *
+ * Part of the handshake rather than of either end, because both have to agree
+ * on it and neither may import the other: the fetcher module RUNS when it is
+ * imported, so a backend that reached into it for a constant would start a
+ * fetcher on whatever thread asked.
+ */
+export const READY = 'sockfetch:ready';
+
 /** Allocate the shared memory for one channel. Transfer the result verbatim. */
 export function createChannel(chunk = DEFAULT_CHUNK) {
   return {
