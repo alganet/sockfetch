@@ -105,7 +105,7 @@ export function createNet({ backend, policy = createPolicy() }) {
     // anything else arrives here already followed.
     if (head.redirected) {
       queue(conn, redirectHead(head.location));
-      conn.hup = true;
+      spend(conn);
       return;
     }
 
@@ -118,7 +118,7 @@ export function createNet({ backend, policy = createPolicy() }) {
     // HEAD has no body to pull, and asking for one would block on a frame the
     // fetcher already terminated.
     conn.response = request.method === 'HEAD' ? null : head;
-    if (!conn.response) conn.hup = true;
+    if (!conn.response) spend(conn);
   }
 
   /** Is there a request waiting, and room to send it? */

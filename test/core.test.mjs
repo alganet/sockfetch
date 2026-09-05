@@ -240,3 +240,30 @@ test('a queued request makes the socket readable, so a poll does not park on it'
   net.send(fd, enc('GET / HTTP/1.1\r\nHost: h.test\r\n\r\n'));
   assert.deepEqual(net.poll(fd), { readable: true, writable: true, hup: false });
 });
+
+test('a HEAD ends the connection as surely as a body does', () => {
+  // Every hangup is the same hangup. A HEAD has no body to run out, and a
+  // synthesized redirect has none either, so both reach the end of the
+  // exchange by a different route than a drained response — and all three have
+  // to leave the connection in one state, or "spent" means three things.
+  const backend = stub({ status: 200, headers: [], contentLength: 9 });
+  const net = createNet({ backend });
+  const fd = net.connect(net.resolve('h.test'), 80);
+  net.send(fd, enc('HEAD /a HTTP/1.1\r\nHost: h.test\r\n\r\nGET /b HTTP/1.1\r\nHost: h.test\r\n\r\n'));
+  const { more } = drain(net, fd);
+  assert.equal(more, false);
+  assert.throws(() => net.send(fd, enc('GET /c HTTP/1.1\r\nHost: h.test\r\n\r\n')),
+    (e) => e.code === 'ECONNRESET');
+  assert.equal(backend.calls.length, 1);
+});
+
+test('a redirect ends it the same way', () => {
+  const backend = stub({ redirected: true, location: 'https://elsewhere.test/x' });
+  const net = createNet({ backend });
+  const fd = net.connect(net.resolve('h.test'), 80);
+  net.send(fd, enc('GET /a HTTP/1.1\r\nHost: h.test\r\n\r\nGET /b HTTP/1.1\r\nHost: h.test\r\n\r\n'));
+  assert.match(drain(net, fd).text, /^HTTP\/1\.1 302 Found/);
+  assert.throws(() => net.send(fd, enc('GET /c HTTP/1.1\r\nHost: h.test\r\n\r\n')),
+    (e) => e.code === 'ECONNRESET');
+  assert.equal(backend.calls.length, 1);
+});
