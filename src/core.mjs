@@ -40,7 +40,14 @@ export function createNet({ backend, policy = createPolicy() }) {
 
   /** Turn one parsed request into a fetch and queue what comes back. */
   function dispatch(conn, request) {
-    const host = request.host || policy.nameOf(conn.addr);
+    // The Host header, then the name an alias stood for, then whatever
+    // connect() was handed. That last step is not a fallback for its own sake:
+    // an Emscripten guest arrives here with a HOSTNAME rather than an address
+    // — its connect syscall reverses its own DNS alias before the socket is
+    // built — so there is nothing for `nameOf` to look up and the right answer
+    // is already in hand. A raw IP lands here too, and connecting to one is a
+    // thing people do.
+    const host = request.host || policy.nameOf(conn.addr) || conn.addr;
     const url = policy.urlFor({ host, port: conn.port, target: request.target });
     if (!url) { conn.error = new SockError('ECONNRESET', 'no host to send this to'); return; }
     if (!policy.allow(url)) {

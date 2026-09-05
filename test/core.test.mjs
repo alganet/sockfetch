@@ -161,6 +161,17 @@ test('closing mid-body cancels the response rather than leaving it pending', () 
   assert.equal(net.open, 0);
 });
 
+test('a connect given a hostname needs no alias to reverse', () => {
+  // What an Emscripten guest does: its connect syscall turns its own DNS alias
+  // back into the name before the socket is constructed, so this end is handed
+  // `example.test` and not 172.29.0.1.
+  const backend = stub({ status: 200, headers: [] });
+  const net = createNet({ backend });
+  const fd = net.connect('example.test', 443);
+  net.send(fd, enc('GET /x HTTP/1.0\r\n\r\n'));
+  assert.equal(String(backend.calls[0].url), 'https://example.test/x');
+});
+
 test('an HTTP/1.0 request with no Host falls back to the name the address stood for', () => {
   const backend = stub({ status: 200, headers: [] });
   const net = createNet({ backend });
