@@ -14,6 +14,7 @@ import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { Worker } from 'node:worker_threads';
 import { createNet, AGAIN, SockError } from '../src/core.mjs';
+import { createPolicy } from '../src/policy.mjs';
 import { createAtomicsBackend } from '../src/backend-atomics.mjs';
 
 const enc = (s) => new TextEncoder().encode(s);
@@ -148,6 +149,20 @@ test('an exchange nobody finished reading leaves nothing behind', { timeout: 300
   const { head, body } = split(exchange('/small').raw);
   assert.match(head, /^HTTP\/1\.1 200 OK\r\n/);
   assert.equal(body.toString(), 'hello world');
+});
+
+test('a server that answers nothing eventually gives up', { timeout: 20000 }, () => {
+  // Without a deadline this test never returns: the thread is in Atomics.wait
+  // for the whole exchange, so a silent origin is not slowness, it is the end
+  // of the session — a hung tab, in a page.
+  const slow = createNet({ backend, policy: createPolicy({ timeout: 250 }) });
+  const fd = slow.connect(slow.resolve('127.0.0.1'), port);
+  slow.send(fd, enc(`GET /silent HTTP/1.1\r\nHost: ${origin}\r\n\r\n`));
+  assert.throws(() => slow.recv(fd, 4096), (e) => e.code === 'ECONNREFUSED');
+  slow.close(fd);
+
+  // And the fetcher is still usable afterwards.
+  assert.match(split(exchange('/small').raw).body.toString(), /hello world/);
 });
 
 test('walking away mid-body does not strand the fetcher', { timeout: 30000 }, () => {

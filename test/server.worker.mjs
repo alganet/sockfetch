@@ -39,6 +39,9 @@ const server = createServer((req, res) => {
   } else if (req.url === '/missing') {
     res.writeHead(404, { 'content-type': 'text/plain' });
     res.end('nope');
+  } else if (req.url === '/silent') {
+    // Accepted, and then nothing — ever. The one failure a synchronous guest
+    // cannot survive without a deadline: it is parked for the whole exchange.
   } else if (req.url === '/echo') {
     const chunks = [];
     req.on('data', (c) => chunks.push(c));

@@ -132,6 +132,12 @@ before the socket is built. A WASI guest has no resolver to begin with, so
 - **A failure is a connection failure.** A CORS refusal, a DNS miss and a port
   with nothing on it are indistinguishable to the browser, so they are
   indistinguishable here: `ECONNREFUSED`, never a hang.
+- **A response has 30 seconds to begin** (`createPolicy({ timeout })`, 0 to
+  disable). The thread that asked is parked for the whole exchange, so an
+  origin that accepts a connection and then says nothing does not slow a guest
+  down — it ends it. The clock covers the wait for headers only and stops when
+  they arrive, so a large download over a slow link is never cut off for taking
+  its time.
 - No cookies or credentials by default: the guest is not the browser's user.
 - No `listen`/`accept`, no UDP, no chunked request bodies.
 

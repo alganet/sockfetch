@@ -37,11 +37,23 @@ async function serve({ up, down, threshold = DEFAULT_THRESHOLD }) {
 }
 
 async function handle(request, body, out, threshold) {
-  const { method, url, headers, credentials } = request;
+  const { method, url, headers, credentials, timeout } = request;
+
+  // A deadline on the wait for HEADERS, cleared the moment they arrive.
+  //
+  // The thread that asked is parked in Atomics.wait until this returns, so an
+  // origin that accepts the connection and then says nothing does not slow the
+  // guest down, it ends it — there is no prompt to come back to and nothing
+  // left that could interrupt. Aborting after the response has started would
+  // be a different and worse rule: a large download over a slow link is doing
+  // exactly what it should.
+  const clock = timeout > 0 ? new AbortController() : null;
+  const alarm = clock ? setTimeout(() => clock.abort(), timeout) : null;
 
   let res;
   try {
     res = await fetch(url, {
+      signal: clock ? clock.signal : undefined,
       method,
       headers,
       // A body is only legal on some methods, and passing an empty one to GET
@@ -58,6 +70,7 @@ async function handle(request, body, out, threshold) {
       referrerPolicy: 'no-referrer',
     });
   } catch (e) {
+    if (alarm !== null) clearTimeout(alarm);
     // Everything arrives here identically: a CORS refusal, a DNS failure, a
     // port nothing HTTP is listening on. The browser deliberately does not say
     // which, so neither can we — and a connection that could not be made is
@@ -69,6 +82,8 @@ async function handle(request, body, out, threshold) {
     out.end();
     return;
   }
+
+  if (alarm !== null) clearTimeout(alarm);
 
   // A redirect the guest asked to hear about. The body is discarded on purpose:
   // it belongs to the URL the guest has not agreed to fetch yet.

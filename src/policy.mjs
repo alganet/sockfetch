@@ -78,9 +78,13 @@ const IPV4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
  *   a port. Only needed for a non-standard one — see `schemeFor`.
  * @param {boolean} [options.credentials] send cookies and auth. Off, and it
  *   should stay off: the guest is not the browser's user.
+ * @param {number} [options.timeout] milliseconds to wait for a response to
+ *   BEGIN; 0 disables it. See `timeout` below for why it is not the whole
+ *   request.
  */
 export function createPolicy(options = {}) {
   const { allow, rewrite, resolve, scheme } = options;
+  const timeout = options.timeout === undefined ? 30000 : options.timeout;
   const credentials = options.credentials ? 'include' : 'omit';
 
   // Both directions of the alias map. `names` is what makes a connect() to an
@@ -163,6 +167,20 @@ export function createPolicy(options = {}) {
     },
 
     credentials,
+
+    /**
+     * How long to wait for a response to START, in milliseconds.
+     *
+     * There has to be one. The thread asking is parked in `Atomics.wait` for
+     * the whole exchange, so an origin that accepts a connection and then says
+     * nothing does not slow the guest down — it ends it, with no prompt to
+     * return to and nothing to interrupt. In a page that is a hung tab.
+     *
+     * It covers the wait for HEADERS and is cleared once they arrive, so a
+     * large download over a slow link is never cut off for taking its time —
+     * only a server that is not answering at all.
+     */
+    timeout,
 
     /** A name's address: the caller's resolver, a literal, or an alias. */
     resolve(hostname) {

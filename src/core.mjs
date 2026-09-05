@@ -64,6 +64,7 @@ export function createNet({ backend, policy = createPolicy() }) {
         headers,
         body: request.body,
         credentials: policy.credentials,
+        timeout: policy.timeout,
       });
     } catch (e) {
       conn.error = new SockError('ECONNRESET', (e && e.message) || String(e));

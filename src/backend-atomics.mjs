@@ -75,6 +75,7 @@ export async function createAtomicsBackend(options = {}) {
         url: String(request.url),
         headers: request.headers,
         credentials: request.credentials || 'omit',
+        timeout: request.timeout,
       })));
       out.write(request.body && request.body.length ? request.body : EMPTY);
 
