@@ -12,6 +12,7 @@
     "./channel": "./src/channel.mjs",
     "./atomics": "./src/backend-atomics.mjs",
     "./websocket": "./src/websocket.mjs",
+    "./wasi": "./src/wasi.mjs",
     "./fetcher.worker.mjs": "./src/fetcher.worker.mjs",
     "./package.json": "./package.json"
   },
