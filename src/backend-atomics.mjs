@@ -70,8 +70,6 @@ export async function createAtomicsBackend(options = {}) {
      *          body?: Uint8Array, credentials?: string}} request
      */
     fetch(request) {
-      // A previous body the guest abandoned left the channel cancelled.
-      back.resume();
       out.write(ENC.encode(JSON.stringify({
         method: request.method,
         url: String(request.url),
@@ -81,7 +79,14 @@ export async function createAtomicsBackend(options = {}) {
       out.write(request.body && request.body.length ? request.body : EMPTY);
 
       const head = JSON.parse(DEC.decode(back.readAll()));
-      let done = false;
+      // Every response is a head AND a body, always, so a caller that has no
+      // use for the body still has to take it. An error and a redirect both
+      // carry an empty one, and leaving either in the channel means the NEXT
+      // exchange reads a terminator where its head should be — which arrives
+      // as "Unexpected end of JSON input" one request later, nowhere near the
+      // request that caused it.
+      let done = !!(head.error || head.redirected);
+      if (done) back.readAll();
 
       return {
         ...head,
@@ -92,11 +97,18 @@ export async function createAtomicsBackend(options = {}) {
           if (last) done = true;
           return bytes.length ? bytes : null;
         },
-        /** Stop early; the fetcher drops the rest. */
+        /**
+         * Stop early.
+         *
+         * The rest of the body is drained rather than abandoned. The fetcher
+         * stops producing as soon as it sees the cancel and then terminates
+         * the message, so this reads a little and returns — and the channel is
+         * left as clean as if the body had been wanted.
+         */
         cancel() {
           if (done) return;
           done = true;
-          back.cancel();
+          back.cancelAndDrain();
         },
       };
     },

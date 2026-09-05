@@ -113,6 +113,33 @@ test('a port with nothing on it is a connection failure, not a hang', { timeout:
   net.close(fd);
 });
 
+test('an exchange nobody finished reading leaves nothing behind', { timeout: 30000 }, () => {
+  // The interaction that was actually broken, and it broke a request LATER
+  // than the one at fault. Every response is a head and a body; a caller with
+  // no use for the body — an error, a redirect, a download it walked away from
+  // — still has to take it, or the next exchange reads a terminator where its
+  // head belongs and fails as "Unexpected end of JSON input", pointing at a
+  // request that did nothing wrong.
+  //
+  // So: three exchanges whose bodies go unread, of all three kinds, and then
+  // an ordinary one that has to be perfect.
+  const fd = net.connect(net.resolve('127.0.0.1'), 1);
+  net.send(fd, enc('GET / HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n'));
+  assert.throws(() => net.recv(fd, 4096), (e) => e.code === 'ECONNREFUSED');
+  net.close(fd);
+
+  split(exchange('/redirect').raw);            // a redirect: body discarded
+
+  const abandoned = net.connect(net.resolve('127.0.0.1'), port);
+  net.send(abandoned, enc(`GET /big HTTP/1.1\r\nHost: ${origin}\r\n\r\n`));
+  net.recv(abandoned, 1 << 16);
+  net.close(abandoned);                        // a body given up on
+
+  const { head, body } = split(exchange('/small').raw);
+  assert.match(head, /^HTTP\/1\.1 200 OK\r\n/);
+  assert.equal(body.toString(), 'hello world');
+});
+
 test('walking away mid-body does not strand the fetcher', { timeout: 30000 }, () => {
   const fd = net.connect(net.resolve('127.0.0.1'), port);
   net.send(fd, enc(`GET /big HTTP/1.1\r\nHost: ${origin}\r\n\r\n`));

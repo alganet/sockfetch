@@ -40,15 +40,20 @@ export function writer(channel) {
   const ctl = new Int32Array(channel.ctl);
   const data = new Uint8Array(channel.data);
 
-  const put = (bytes, last) => {
-    // Wait for the previous chunk to be taken. Re-checked after every wake,
-    // because a notify is a hint rather than a promise — a spurious wake or a
-    // cancel both land here.
-    while (Atomics.load(ctl, FULL) === 1) {
-      if (Atomics.load(ctl, CANCEL) === 1) return false;
+  /**
+   * `force` writes even under a cancel, and exactly one thing uses it: the
+   * terminator. A cancelled message still has to END, because the reader is
+   * draining to the end of it — see the reader's cancel(). A refused
+   * terminator is a reader that drains for ever.
+   */
+  const put = (bytes, last, force) => {
+    // Re-checked on every wake, because a notify is a hint rather than a
+    // promise: a spurious wake and a cancel both land here.
+    for (;;) {
+      if (!force && Atomics.load(ctl, CANCEL) === 1) return false;
+      if (Atomics.load(ctl, FULL) === 0) break;
       Atomics.wait(ctl, FULL, 1);
     }
-    if (Atomics.load(ctl, CANCEL) === 1) return false;
     data.set(bytes, 0);
     Atomics.store(ctl, LEN, bytes.length);
     Atomics.store(ctl, LAST, last ? 1 : 0);
@@ -79,7 +84,7 @@ export function writer(channel) {
       return true;
     },
     /** Send an empty terminator — an empty body is still a message. */
-    end() { return put(new Uint8Array(0), true); },
+    end() { return put(new Uint8Array(0), true, true); },
     cancelled() { return Atomics.load(ctl, CANCEL) === 1; },
   };
 }
@@ -125,13 +130,37 @@ export function reader(channel) {
      * holding its whole thread.
      */
     cancel() {
+      // The flag only. Clearing FULL here would DISCARD a chunk the writer had
+      // already handed over, and the writer — which may be awaiting something
+      // else at this instant — would then write its next one into a channel
+      // that has silently moved on. Every frame after that is one behind: a
+      // body fragment arrives where a response head belongs, and the exchange
+      // after it never completes.
+      //
+      // So a cancel says "stop early", and the caller drains to the end of the
+      // message it stops. Nothing is ever left in the channel for the next
+      // exchange to trip over.
       Atomics.store(ctl, CANCEL, 1);
-      Atomics.store(ctl, FULL, 0);
       Atomics.notify(ctl, FULL);
     },
-    resume() {
-      Atomics.store(ctl, CANCEL, 0);
-      Atomics.store(ctl, FULL, 0);
+    /**
+     * Stop caring, then read to the end of the message anyway.
+     *
+     * The terminator IS the acknowledgement: the writer only sends one after
+     * it has stopped producing, so seeing it means there is nothing further in
+     * flight and the flag can be cleared here safely. Leaving it set instead
+     * would refuse the NEXT message's head — silently, since a refused write
+     * returns false into a caller with nothing useful to do about it — and the
+     * guest would parse a terminator as a head.
+     */
+    cancelAndDrain() {
+      this.cancel();
+      for (;;) {
+        if (this.read().last) {
+          Atomics.store(ctl, CANCEL, 0);
+          return;
+        }
+      }
     },
   };
 }

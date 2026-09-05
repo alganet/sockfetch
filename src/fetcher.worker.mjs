@@ -103,14 +103,17 @@ async function handle(request, body, out, threshold) {
     contentLength: complete ? total : null,
   })));
 
+  // Every path below ends the message, the cut-short ones included: the guest
+  // drains to the terminator, so one that never arrives is a guest that waits
+  // for ever.
   for (const part of held) {
-    if (!out.chunk(part, false)) { await cancel(stream); return; }
+    if (!out.chunk(part, false)) { await cancel(stream); out.end(); return; }
   }
   if (!complete) {
     for (;;) {
       const { value, done } = await stream.read();
       if (done) break;
-      if (!out.chunk(value, false)) { await cancel(stream); return; }
+      if (!out.chunk(value, false)) { await cancel(stream); out.end(); return; }
     }
   }
   out.end();
