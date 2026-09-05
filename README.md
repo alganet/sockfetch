@@ -141,6 +141,16 @@ before the socket is built. A WASI guest has no resolver to begin with, so
 - No cookies or credentials by default: the guest is not the browser's user.
 - No `listen`/`accept`, no UDP, no chunked request bodies.
 
+## Bundlers
+
+The fetcher is loaded as `new URL('./fetcher.worker.mjs', import.meta.url)`,
+which a bundler will not follow — it emits no worker file and the URL points at
+nothing. Build it as its own entry point and say where it went:
+
+```js
+await createAtomicsBackend({ workerUrl: new URL('./fetcher.worker.js', import.meta.url) });
+```
+
 ## Tests
 
 ```sh
