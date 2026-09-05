@@ -26,8 +26,11 @@ core       connection table · HTTP/1.1 codec · policy
 backend    Atomics.wait + fetcher worker  →  fetch()
 ```
 
-**Only HTTP can ever work**, because only HTTP can leave a browser. There is no
-SSH, no MySQL, no raw TCP here, and there cannot be.
+**Only HTTP crosses the boundary**, because `fetch` is the only way out of a
+browser. `https://` is included and is the ordinary case — the guest speaks
+plaintext and the host does the TLS, which is what the section below is about.
+What cannot exist here is anything that is not HTTP: no SSH, no MySQL, no raw
+TCP, and no amount of work will add them.
 
 ## Why it needs no stack switching
 
@@ -84,10 +87,15 @@ An address is unavoidable: `getaddrinfo` fills a `sockaddr_in`, `connect` takes
 it back, `wget` prints it. The real one is unobtainable — the browser exposes no
 resolver and `fetch` never reveals the peer.
 
-So it is an **alias**, in `172.29.0.0/16` with a reverse map. That range is
-Emscripten's own choice for the same problem, so a guest built with Emscripten
-needs no allocator from here at all, and both kinds of guest describe a host the
-same way: an ordinary machine behind a NAT, which is a fair description.
+So it is an **alias**, in `172.29.0.0/16` with a reverse map — the range
+Emscripten's own DNS invents for the same problem, matched on purpose so that a
+script prints the same kind of address whichever guest it runs in: an ordinary
+machine behind a NAT, which is a fair description of one.
+
+An Emscripten guest needs no allocator from here at all, and hands this end a
+**hostname** rather than an address: its connect syscall reverses its own alias
+before the socket is built. A WASI guest has no resolver to begin with, so
+`resolve()` is where one is invented for it.
 
 ## What the guest sees, and does not
 

@@ -10,7 +10,9 @@
 // wget, PHP's own http:// wrapper — work unmodified, against any origin that
 // allows CORS. No relay, no server, no Asyncify, no JSPI.
 //
-// Only HTTP can ever work here, because only HTTP can leave a browser.
+// Only HTTP crosses the boundary, because fetch is the only way out of a
+// browser — https:// included, with the host doing the TLS and the guest
+// speaking plaintext. Anything that is not HTTP cannot be reached at all.
 
 export { createNet, AGAIN, SockError } from './core.mjs';
 export { createPolicy } from './policy.mjs';
