@@ -59,12 +59,12 @@ test('a GET becomes a fetch, and the response comes back as HTTP the guest can r
   const fd = net.connect(net.resolve('pypi.org'), 443);
 
   net.send(fd, enc('GET /simple/flask/ HTTP/1.1\r\nHost: pypi.org\r\nUser-Agent: Wget\r\n\r\n'));
+  assert.equal(backend.calls.length, 0, 'a write queues the request; the read is what sends it');
 
+  const { text, more } = drain(net, fd);
   assert.equal(backend.calls.length, 1);
   assert.equal(String(backend.calls[0].url), 'https://pypi.org/simple/flask/');
   assert.deepEqual(backend.calls[0].headers, [], 'Host and User-Agent are both dropped');
-
-  const { text, more } = drain(net, fd);
   assert.equal(more, false, 'the body ends in EOF, as Connection: close promises');
   assert.match(text, /^HTTP\/1\.1 200 OK\r\n/);
   assert.match(text, /content-type: text\/plain/);
@@ -125,8 +125,8 @@ test('an origin the policy refuses never reaches the backend', () => {
   });
   const fd = net.connect(net.resolve('blocked.test'), 443);
   net.send(fd, enc('GET / HTTP/1.1\r\nHost: blocked.test\r\n\r\n'));
-  assert.equal(backend.calls.length, 0);
   assert.throws(() => net.recv(fd, 100), (e) => e.code === 'ECONNREFUSED');
+  assert.equal(backend.calls.length, 0, 'refused before anything was asked of the network');
 });
 
 test('HEAD is answered without pulling a body that was never sent', () => {
@@ -158,8 +158,10 @@ test('a POST carries its body through, once Content-Length says it is all there'
   const net = createNet({ backend });
   const fd = net.connect(net.resolve('h.test'), 80);
   net.send(fd, enc('POST /x HTTP/1.1\r\nHost: h.test\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\n'));
-  assert.equal(backend.calls.length, 0, 'the body has not arrived yet');
+  assert.equal(net.recv(fd, 100), AGAIN, 'the body has not arrived yet, so there is nothing to send');
+  assert.equal(backend.calls.length, 0);
   net.send(fd, enc('hello'));
+  drain(net, fd);
   assert.equal(backend.calls.length, 1);
   assert.equal(dec(backend.calls[0].body), 'hello');
   assert.deepEqual(backend.calls[0].headers, [['Content-Type', 'text/plain']]);
@@ -185,6 +187,7 @@ test('a connect given a hostname needs no alias to reverse', () => {
   const net = createNet({ backend });
   const fd = net.connect('example.test', 443);
   net.send(fd, enc('GET /x HTTP/1.0\r\n\r\n'));
+  drain(net, fd);
   assert.equal(String(backend.calls[0].url), 'https://example.test/x');
 });
 
@@ -194,5 +197,46 @@ test('an HTTP/1.0 request with no Host falls back to the name the address stood 
   const addr = net.resolve('old.test');
   const fd = net.connect(addr, 80);
   net.send(fd, enc('GET /x HTTP/1.0\r\n\r\n'));
+  drain(net, fd);
   assert.equal(String(backend.calls[0].url), 'http://old.test/x');
+});
+
+// ---------------------------------------------------------------------------
+// One connection, one exchange — and everything the guest wrote behind it.
+// ---------------------------------------------------------------------------
+
+test('a second request written with the first is never answered in place of a later one', () => {
+  // The bug this is here for did not lose a request, it MISDELIVERED one. Both
+  // requests were parsed and only the first was sent; the second sat in the
+  // queue until the guest wrote again, and then went out instead of what the
+  // guest had just asked for. Measured: a guest that asked for /one and then
+  // /three was served /one and /two, with the wrong body handed to the wrong
+  // read and nothing anywhere saying so.
+  const backend = stub(
+    { status: 200, headers: [], contentLength: 3, body: ['one'] },
+    { status: 200, headers: [], contentLength: 3, body: ['two'] },
+  );
+  const net = createNet({ backend });
+  const fd = net.connect(net.resolve('h.test'), 80);
+  net.send(fd, enc('GET /one HTTP/1.1\r\nHost: h.test\r\n\r\nGET /two HTTP/1.1\r\nHost: h.test\r\n\r\n'));
+
+  const { text, more } = drain(net, fd);
+  assert.match(text, /\r\n\r\none$/);
+  assert.equal(more, false, 'Connection: close means this connection is finished');
+
+  // And it IS finished: writing to it is writing to a closed connection, which
+  // is the answer the guest was promised rather than a stale reply.
+  assert.throws(() => net.send(fd, enc('GET /three HTTP/1.1\r\nHost: h.test\r\n\r\n')),
+    (e) => e instanceof SockError && e.code === 'ECONNRESET');
+  assert.equal(backend.calls.length, 1, '/two was dropped with the connection, not saved up');
+});
+
+test('a queued request makes the socket readable, so a poll does not park on it', () => {
+  // poll() is asked before the read that would send the request. If it said
+  // "not readable" the guest would wait for bytes that only its own next read
+  // can cause to exist — a wait nothing wakes.
+  const net = createNet({ backend: stub({ status: 200, headers: [], body: ['x'] }) });
+  const fd = net.connect(net.resolve('h.test'), 80);
+  net.send(fd, enc('GET / HTTP/1.1\r\nHost: h.test\r\n\r\n'));
+  assert.deepEqual(net.poll(fd), { readable: true, writable: true, hup: false });
 });

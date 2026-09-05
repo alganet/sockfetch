@@ -39,8 +39,8 @@ returns, with no event loop turn available in between. That is the problem
 Asyncify and JSPI exist to solve, and this package sidesteps it twice over.
 
 HTTP is strictly **write-then-read**, so by the time a guest blocks on a
-response its request is already complete — the exchange can happen inside
-`send()` and the bytes can be handed over before it returns. And where a real
+response its request is already complete — nothing has to be sent until the
+guest reads, and the bytes can be handed over inside that read. Where a real
 wait is needed, `Atomics.wait` parks the guest's thread while another thread
 awaits the fetch. Neither end may be a browser's main thread; `Atomics.wait`
 throws there.
@@ -138,6 +138,13 @@ before the socket is built. A WASI guest has no resolver to begin with, so
   down — it ends it. The clock covers the wait for headers only and stops when
   they arrive, so a large download over a slow link is never cut off for taking
   its time.
+- **One exchange per connection**, which is what every response already says:
+  a streamed body has no end marker but the close, so `Connection: close` is
+  not a preference. A request written behind one that was already answered is
+  dropped with the connection, and the write after it fails as `ECONNRESET` —
+  the same answer a real closed socket gives. Nothing is saved up: a queued
+  request that outlived its connection used to go out later, in place of
+  whatever the guest asked for next.
 - No cookies or credentials by default: the guest is not the browser's user.
 - No `listen`/`accept`, no UDP, no chunked request bodies.
 

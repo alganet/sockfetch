@@ -4,11 +4,27 @@
 
 // The connection table: what a guest's socket actually is here.
 //
-// A connection holds a request parser, a queue of bytes waiting to be read, and
-// at most one response being pulled from the backend. `send` feeds the parser
-// and, when a request completes, turns it into a fetch; `recv` drains the queue
-// and then the response body. Nothing above this file knows about sockets and
-// nothing below it knows about HTTP.
+// A connection holds a request parser, a queue of requests waiting to go out, a
+// queue of bytes waiting to be read, and at most one response being pulled from
+// the backend. `send` feeds the parser; `recv` drains what is ready and, when
+// there is nothing left, turns the next parsed request into a fetch. Nothing
+// above this file knows about sockets and nothing below it knows about HTTP.
+//
+// ## Why the fetch happens in `recv` and not in `send`
+//
+// It used to happen inline in `send`, which HTTP allows — the exchange is
+// strictly write-then-read, so the request is complete before the guest blocks
+// — and which cost nothing while the only backend was a synchronous one.
+//
+// Two things wanted it moved. A guest that writes two requests in one `write(2)`
+// had the second one PARSED and then stranded: `send` stopped at the first
+// response, nothing else ever called `take()`, and a later write on the same
+// connection dispatched the stale request instead of the new one. Measured: a
+// guest that asked for `/one` and then `/three` was served `/one` and `/two`,
+// silently, with the wrong body handed to the wrong read.
+//
+// And a fetch that wants to be AWAITED has to happen where a caller can wait —
+// which is a read, never a write. See `readyAsync`.
 
 import { createRequestParser, serializeHead, redirectHead, reasonFor } from './codec.mjs';
 import { createPolicy } from './policy.mjs';
@@ -38,8 +54,17 @@ export function createNet({ backend, policy = createPolicy() }) {
 
   const queue = (conn, bytes) => { if (bytes.length) conn.outbox.push(bytes); };
 
-  /** Turn one parsed request into a fetch and queue what comes back. */
-  function dispatch(conn, request) {
+  /**
+   * What this request would be, as something the backend can be asked for.
+   *
+   * Split out from the asking so that both a synchronous backend and an
+   * awaited one decide the same things in the same order — the policy sees
+   * every request exactly once either way, and neither path can grow a rule
+   * the other does not have.
+   *
+   * Returns null having set `conn.error` when the request cannot go out at all.
+   */
+  function plan(conn, request) {
     // The Host header, then the name an alias stood for, then whatever
     // connect() was handed. That last step is not a fallback for its own sake:
     // an Emscripten guest arrives here with a HOSTNAME rather than an address
@@ -49,28 +74,25 @@ export function createNet({ backend, policy = createPolicy() }) {
     // thing people do.
     const host = request.host || policy.nameOf(conn.addr) || conn.addr;
     const url = policy.urlFor({ host, port: conn.port, target: request.target });
-    if (!url) { conn.error = new SockError('ECONNRESET', 'no host to send this to'); return; }
+    if (!url) { conn.error = new SockError('ECONNRESET', 'no host to send this to'); return null; }
     if (!policy.allow(url)) {
       conn.error = new SockError('ECONNREFUSED', `refused by policy: ${url.origin}`);
-      return;
+      return null;
     }
 
     const { headers } = policy.headersFor(request.headers);
-    let head;
-    try {
-      head = backend.fetch({
-        method: request.method,
-        url: policy.rewrite(url),
-        headers,
-        body: request.body,
-        credentials: policy.credentials,
-        timeout: policy.timeout,
-      });
-    } catch (e) {
-      conn.error = new SockError('ECONNRESET', (e && e.message) || String(e));
-      return;
-    }
+    return {
+      method: request.method,
+      url: policy.rewrite(url),
+      headers,
+      body: request.body,
+      credentials: policy.credentials,
+      timeout: policy.timeout,
+    };
+  }
 
+  /** What the backend answered, as bytes the guest can read. */
+  function deliver(conn, request, head) {
     if (head.error) {
       conn.error = new SockError(head.error, head.message);
       return;
@@ -97,6 +119,42 @@ export function createNet({ backend, policy = createPolicy() }) {
     if (!conn.response) conn.hup = true;
   }
 
+  /** Is there a request waiting, and room to send it? */
+  const idle = (conn) =>
+    conn.pending.length && !conn.response && !conn.outbox.length && !conn.error && !conn.hup;
+
+  /** Send the next queued request, synchronously. */
+  function pump(conn) {
+    if (!idle(conn)) return;
+    const request = conn.pending.shift();
+    const asked = plan(conn, request);
+    if (!asked) return;
+    let head;
+    try { head = backend.fetch(asked); }
+    catch (e) { conn.error = new SockError('ECONNRESET', (e && e.message) || String(e)); return; }
+    deliver(conn, request, head);
+  }
+
+  /**
+   * The connection is over, and everything still queued on it goes with it.
+   *
+   * Every response carries `Connection: close` (see the codec — a streamed body
+   * has no other end marker), so one exchange is all a connection gets and the
+   * guest has been told so. What must not happen is the leftovers being ANSWERED
+   * later: a request parsed but never sent used to sit in the queue until the
+   * guest wrote again, and then went out in place of what the guest had just
+   * asked for.
+   *
+   * So they are dropped here, and a write after this fails as `ECONNRESET` —
+   * which is what writing to a closed connection does, and what the guest was
+   * promised.
+   */
+  function spend(conn) {
+    conn.hup = true;
+    conn.pending.length = 0;
+    conn.parser = null;
+  }
+
   return {
     /** A name's address. See policy.resolve — it is an alias, not a lookup. */
     resolve(hostname) { return policy.resolve(hostname); },
@@ -117,6 +175,7 @@ export function createNet({ backend, policy = createPolicy() }) {
       conns.set(handle, {
         addr, port,
         parser: createRequestParser(),
+        pending: [],
         outbox: [],
         offset: 0,
         response: null,
@@ -126,19 +185,27 @@ export function createNet({ backend, policy = createPolicy() }) {
       return handle;
     },
 
-    /** Bytes from the guest. Returns how many were taken — always all of them. */
+    /**
+     * Bytes from the guest. Returns how many were taken — always all of them.
+     *
+     * Everything complete is parsed and QUEUED; nothing is sent from here. A
+     * guest that writes two requests at once therefore has both of them, in
+     * order, rather than one and a trap.
+     */
     send(handle, bytes) {
       const conn = conns.get(handle);
       if (!conn) throw new SockError('EBADF');
       if (conn.error) throw conn.error;
+      // The exchange is finished and the guest was told the connection closes.
+      // Writing anyway is writing to a closed connection.
+      if (conn.hup) throw new SockError('ECONNRESET', 'this connection is closed; it said so');
       let request = conn.parser.push(bytes);
       while (request) {
         if (request.error) {
           conn.error = new SockError('ECONNRESET', request.error);
           throw conn.error;
         }
-        dispatch(conn, request);
-        if (conn.error || conn.response || conn.hup) break;
+        conn.pending.push(request);
         request = conn.parser.take();
       }
       return bytes.length;
@@ -153,6 +220,8 @@ export function createNet({ backend, policy = createPolicy() }) {
     recv(handle, max) {
       const conn = conns.get(handle);
       if (!conn) throw new SockError('EBADF');
+      // Nothing in hand and something queued: this is where a request goes out.
+      if (idle(conn)) pump(conn);
       if (conn.outbox.length) {
         const head = conn.outbox[0];
         const take = Math.min(max, head.length - conn.offset);
@@ -166,7 +235,7 @@ export function createNet({ backend, policy = createPolicy() }) {
       if (conn.error) throw conn.error;
       if (conn.response) {
         const chunk = conn.response.read();
-        if (chunk === null) { conn.response = null; conn.hup = true; return EMPTY; }
+        if (chunk === null) { conn.response = null; spend(conn); return EMPTY; }
         if (chunk.length <= max) return chunk;
         // The window is bigger than the guest's buffer; keep the rest.
         conn.outbox.push(chunk.subarray(max));
@@ -181,7 +250,11 @@ export function createNet({ backend, policy = createPolicy() }) {
       const conn = conns.get(handle);
       if (!conn) return { readable: false, writable: false, hup: true };
       return {
-        readable: !!(conn.outbox.length || conn.response || conn.hup || conn.error),
+        // A queued request counts: the bytes are not here yet, but asking for
+        // them is this side's work and the read that follows will do it. Saying
+        // "not readable" would send the guest to a wait that nothing wakes.
+        readable: !!(conn.outbox.length || conn.response || conn.pending.length
+          || conn.hup || conn.error),
         // Always: a write is buffered into the parser and never blocks.
         writable: true,
         hup: conn.hup && !conn.outbox.length && !conn.response,
