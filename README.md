@@ -60,6 +60,15 @@ const php = await Phasm({ socket: createSocketClass(net) });
 php.run({ code: `echo file_get_contents('https://pypi.org/simple/flask/');` });
 ```
 
+For a WASI guest — one whose shim owns its own file descriptors — the adapter
+is thinner still, because there is no WebSocket to imitate:
+
+```js
+import { wasiNet } from 'sockfetch/wasi';
+
+await run({ net: wasiNet(net), args: ['wget', '-q', '-O', '-', url] });
+```
+
 `createNet({ backend, policy })` is the core. `createPolicy()` decides the
 scheme, which headers survive, which origins are allowed, and what a hostname
 resolves to — pass your own to front a CORS proxy or enforce an allowlist.
