@@ -11,9 +11,8 @@
     "./policy": "./src/policy.mjs",
     "./channel": "./src/channel.mjs",
     "./atomics": "./src/backend-atomics.mjs",
-    "./fetcher.worker.mjs": "./src/fetcher.worker.mjs",
     "./websocket": "./src/websocket.mjs",
-    "./wasi": "./src/wasi.mjs",
+    "./fetcher.worker.mjs": "./src/fetcher.worker.mjs",
     "./package.json": "./package.json"
   },
   "files": [
