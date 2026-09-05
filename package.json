@@ -1,0 +1,37 @@
+{
+  "name": "sockfetch",
+  "version": "0.1.0",
+  "description": "A synchronous TCP socket for wasm guests, backed by fetch(). Real HTTP clients, no relay.",
+  "license": "ISC",
+  "author": "Alexandre Gomes Gaigalas <alganet@gmail.com>",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./codec": "./src/codec.mjs",
+    "./policy": "./src/policy.mjs",
+    "./channel": "./src/channel.mjs",
+    "./atomics": "./src/backend-atomics.mjs",
+    "./fetcher.worker.mjs": "./src/fetcher.worker.mjs",
+    "./websocket": "./src/websocket.mjs",
+    "./wasi": "./src/wasi.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "test": "node --test --test-concurrency=1"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "wasm",
+    "wasi",
+    "emscripten",
+    "socket",
+    "fetch",
+    "http",
+    "browser"
+  ]
+}
