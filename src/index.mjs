@@ -13,11 +13,21 @@
 // Only HTTP crosses the boundary, because fetch is the only way out of a
 // browser — https:// included, with the host doing the TLS and the guest
 // speaking plaintext. Anything that is not HTTP cannot be reached at all.
+//
+// It answers in the other direction too. A guest that LISTENS is handed
+// requests the host already has — a service worker's fetch, a test's fixture —
+// and the response it writes is read back out. Same connection table, same
+// codec, same handles: what `accept()` returns is an ordinary handle that
+// `send`, `recv`, `poll` and `close` already serve. See ./serve.mjs.
 
 export { createNet, AGAIN, SockError } from './core.mjs';
 export { createPolicy } from './policy.mjs';
 export { createAtomicsBackend } from './backend-atomics.mjs';
 export { createDirectBackend } from './backend-direct.mjs';
 export { beginExchange, DEFAULT_THRESHOLD } from './exchange.mjs';
-export { createRequestParser, serializeHead, redirectHead, reasonFor } from './codec.mjs';
+export { createPorts } from './serve.mjs';
+export {
+  createRequestParser, serializeHead, redirectHead, reasonFor,
+  createResponseParser, serializeRequestHead,
+} from './codec.mjs';
 export { createChannel, reader, writer, DEFAULT_CHUNK } from './channel.mjs';

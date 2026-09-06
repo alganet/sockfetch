@@ -177,7 +177,58 @@ before the socket is built. A WASI guest has no resolver to begin with, so
   request that outlived its connection used to go out later, in place of
   whatever the guest asked for next.
 - No cookies or credentials by default: the guest is not the browser's user.
-- No `listen`/`accept`, no UDP, no chunked request bodies.
+- No UDP, and no chunked request bodies.
+
+## Serving: the same thing, pointed the other way
+
+A guest can be a **server** here too. The host has a request already — a
+service worker's `fetch`, a fixture in a test — and hands it to a guest that
+believes it accepted a connection; the guest writes a response, and the host
+reads it back out.
+
+```js
+const net = createNet({ backend, park });
+
+const listener = net.listen('0.0.0.0', 8000);   // the guest does this, via its shim
+net.deliver(8000, { method: 'GET', target: '/' }, (answer) => {
+  // { status, statusText, headers, body } — or { error }
+});
+```
+
+**What `accept()` gives back is an ordinary handle.** `send`, `recv`, `poll` and
+`close` already serve it, so nothing is added for reading or writing an accepted
+connection and the two halves share one handle space. That is the contract, not
+an implementation detail: a shim must not have to know which kind it holds.
+
+**`park` is the whole of what an embedder supplies.** A guest holding the thread
+cannot be reached by `postMessage`, so how a request arrives while a server is
+blocked is the embedder's problem — shared memory in a browser, an ordinary call
+under node. `park(ms)` blocks for up to that long, delivering whatever it finds;
+`net.wait` exists only when it was given, and its absence is what tells a shim
+to keep the old non-blocking behaviour. Without it an accept loop spins at full
+CPU and never yields to the JS that would feed it.
+
+**`onResponse` is synchronous and called exactly once.** A promise would settle
+on a microtask queue that does not run until the guest yields, which for a
+running server is never.
+
+Three details a real server depends on:
+
+- **The request always carries a `Content-Length`**, counted here rather than
+  copied, and the read ends by that length rather than by an EOF. A server
+  reading zero bytes takes it for a client that hung up — `php -S` closes the
+  client on one — so a drained request answers `EAGAIN`, the way a real client
+  that is waiting for its answer looks.
+- **A response can end three ways** and all three are read: `Content-Length`,
+  `Transfer-Encoding: chunked`, or the close, which is what `php -S` does for
+  dynamic output.
+- **A host is never left holding a request nothing answers.** A listener that
+  goes away settles everything it owes, and a server that stops mid-response
+  says so rather than handing back a truncated body.
+
+`ports()` and `onPort(fn)` are what a UI watches; a subscriber is caught up with
+an `open` for everything already listening, so it needs no `ports()` call beside
+its subscribe and no rule for which won the race.
 
 ## Bundlers
 

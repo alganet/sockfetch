@@ -181,7 +181,75 @@ export function createSocketClass(net, options = {}) {
       const list = this._listeners.get(type);
       if (list) this._listeners.set(type, list.filter((f) => f !== fn));
     }
+
+    /**
+     * Hand the guest whatever is waiting, now.
+     *
+     * `send()` calls this for a connection the guest DIALLED, because there the
+     * bytes only ever exist as an answer to something written. A connection the
+     * guest ACCEPTED receives first — the request is there before it writes a
+     * word — and there is no send() to hang the delivery off, so whoever built
+     * the peer calls this once SOCKFS has attached its handlers.
+     *
+     * Not the constructor's job, and it cannot be: `createPeer` assigns
+     * `onmessage` after the peer object exists, so anything delivered before
+     * that is delivered to nobody.
+     */
+    pump() { this._drain(); }
+
+    /**
+     * The next connection on a listening handle, already wrapped — or null.
+     *
+     * A static on the class rather than a free function because it needs the
+     * net, and the class is the thing that already has it. An adapter driving
+     * SOCKFS then needs no second import and no view about how a duck is
+     * built: it asks for the next peer and pushes it where SOCKFS looks.
+     */
+    static accepted(listenHandle, peer) {
+      const handle = net.accept(listenHandle);
+      if (handle === null || handle === undefined) return null;
+      return acceptedSocket(this, handle, peer);
+    }
   });
+}
+
+/**
+ * A connection somebody dialled US, wrapped for SOCKFS — the mirror of the
+ * constructor above.
+ *
+ * It does not dial, because there is nothing to dial: `net.accept()` already
+ * handed back a live handle. Everything else about the object is identical,
+ * which is what lets SOCKFS's own `accept` and `recvmsg` serve it unchanged.
+ *
+ * `_socket` is the one field a dialled socket never has. SOCKFS's `createPeer`
+ * branches on it to name the remote end of a peer it did not construct
+ * (`ws._socket.remoteAddress`), and without it the peer is built from `ws.url`
+ * instead — a path that throws on anything that is not `ws://host:port`. There
+ * is no wire and so no real remote address; loopback is the honest answer, and
+ * it is what the guest would see from a client on the same machine anyway.
+ *
+ * @param {Function} SocketClass what createSocketClass() returned
+ * @param {unknown} handle from net.accept()
+ * @param {{address?: string, port?: number}} [peer]
+ */
+export function acceptedSocket(SocketClass, handle, peer = {}) {
+  const address = peer.address || '127.0.0.1';
+  const port = peer.port || 0;
+  const sock = Object.create(SocketClass.prototype);
+  sock.url = `ws://${address}:${port}`;
+  sock.binaryType = 'arraybuffer';
+  sock.onopen = null;
+  sock.onmessage = null;
+  sock.onerror = null;
+  sock.onclose = null;
+  sock._listeners = new Map();
+  sock._closed = false;
+  // OPEN from the start, for the reason the constructor gives: SOCKFS reports
+  // writability off readyState, and there is no later moment we control.
+  sock.readyState = SocketClass.OPEN;
+  sock._fd = handle;
+  sock._socket = { remoteAddress: address, remotePort: port };
+  return sock;
 }
 
 // The readyState constants. SOCKFS reads them off the INSTANCE

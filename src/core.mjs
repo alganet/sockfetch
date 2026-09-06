@@ -28,6 +28,7 @@
 
 import { createRequestParser, serializeHead, redirectHead, reasonFor } from './codec.mjs';
 import { createPolicy } from './policy.mjs';
+import { createPorts } from './serve.mjs';
 
 /** `recv` has nothing yet, and the guest asked not to block. */
 export const AGAIN = Symbol('EAGAIN');
@@ -43,8 +44,11 @@ const EMPTY = new Uint8Array(0);
  * @param {object} options
  * @param {{fetch: Function}} options.backend usually createAtomicsBackend()'s
  * @param {object} [options.policy] createPolicy()'s, or one of your own
+ * @param {(ms: number) => void} [options.park] block this thread for up to `ms`,
+ *   delivering whatever inbound work arrives. It is what lets a guest that is a
+ *   SERVER wait rather than spin; see ./serve.mjs. Absent, `wait` is absent.
  */
-export function createNet({ backend, policy = createPolicy() }) {
+export function createNet({ backend, policy = createPolicy(), park }) {
   const canBlock = typeof backend?.fetch === 'function';
   const canAwait = typeof backend?.fetchAsync === 'function';
   if (!canBlock && !canAwait) {
@@ -53,6 +57,12 @@ export function createNet({ backend, policy = createPolicy() }) {
 
   const conns = new Map();
   let nextHandle = 1;
+
+  // The inbound half, over the SAME handle allocator. That sharing is the
+  // contract rather than a convenience: what accept() hands back has to be
+  // something send/recv/poll/close already serve, so the two kinds of
+  // connection cannot be told apart by their handles and must not need to be.
+  const ports = createPorts({ alloc: () => nextHandle++, park });
 
   const queue = (conn, bytes) => { if (bytes.length) conn.outbox.push(bytes); };
 
@@ -207,6 +217,7 @@ export function createNet({ backend, policy = createPolicy() }) {
      * order, rather than one and a trap.
      */
     send(handle, bytes) {
+      if (ports.owns(handle)) return ports.send(handle, bytes);
       const conn = conns.get(handle);
       if (!conn) throw new SockError('EBADF');
       if (conn.error) throw conn.error;
@@ -232,6 +243,7 @@ export function createNet({ backend, policy = createPolicy() }) {
      * which here means the guest has not finished writing its request.
      */
     recv(handle, max) {
+      if (ports.owns(handle)) return ports.recv(handle, max);
       const conn = conns.get(handle);
       if (!conn) throw new SockError('EBADF');
       // Nothing in hand and something queued: this is where a request goes out.
@@ -296,6 +308,7 @@ export function createNet({ backend, policy = createPolicy() }) {
 
     /** What select/poll wants to know. */
     poll(handle) {
+      if (ports.owns(handle)) return ports.poll(handle);
       const conn = conns.get(handle);
       if (!conn) return { readable: false, writable: false, hup: true };
       return {
@@ -311,6 +324,7 @@ export function createNet({ backend, policy = createPolicy() }) {
     },
 
     close(handle) {
+      if (ports.owns(handle)) return ports.close(handle);
       const conn = conns.get(handle);
       if (!conn) return false;
       if (conn.response) conn.response.cancel();
@@ -318,7 +332,28 @@ export function createNet({ backend, policy = createPolicy() }) {
       return true;
     },
 
+    // ─── the inbound half — see ./serve.mjs ───────────────────────────────
+
+    /** Take a port. Throws EADDRINUSE if something already has it. */
+    listen(address, port) { return ports.listen(address, port); },
+    /** The next connection on a listening handle, or null for nobody yet. */
+    accept(handle) { return ports.accept(handle); },
+    /** Park until something arrives. Absent without `park` — see createNet. */
+    wait: ports.wait,
+    /** What is listening, right now. */
+    ports() { return ports.ports(); },
+    /** Called when a port opens or closes; caught up on subscribe. */
+    onPort(fn) { return ports.onPort(fn); },
+    /**
+     * Hand a request to whatever is listening. False when nothing is.
+     *
+     * `deliver` rather than `open`, which is what it would naturally be called:
+     * `net.open` is already the live-connection count, and a method that
+     * shadowed it would have broken every teardown that reads one.
+     */
+    deliver(port, request, onResponse) { return ports.deliver(port, request, onResponse); },
+
     /** Open connections, for a test or a teardown. */
-    get open() { return conns.size; },
+    get open() { return conns.size + ports.open; },
   };
 }

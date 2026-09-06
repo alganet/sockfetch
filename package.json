@@ -8,6 +8,7 @@
   "exports": {
     ".": "./src/index.mjs",
     "./codec": "./src/codec.mjs",
+    "./serve": "./src/serve.mjs",
     "./policy": "./src/policy.mjs",
     "./channel": "./src/channel.mjs",
     "./atomics": "./src/backend-atomics.mjs",

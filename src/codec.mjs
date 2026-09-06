@@ -209,3 +209,210 @@ export function reasonFor(status) {
     : status < 300 ? 'OK' : status < 400 ? 'Redirect'
     : status < 500 ? 'Client Error' : 'Server Error');
 }
+
+// ─── the other direction ─────────────────────────────────────────────────────
+//
+// Everything above serves a guest that is a CLIENT: it parses the request the
+// guest wrote and serialises the response it should read. A guest that is a
+// SERVER needs the mirror — a request written INTO it, and a response read back
+// OUT of it — and that is what follows.
+//
+// The two halves share `endOfHead` and the CRLF rules and nothing else, because
+// a request line and a status line are different grammars. They are here rather
+// than in a file of their own for the reason the file exists: one place that
+// knows how HTTP/1.1 is spelled, so the two directions cannot disagree about it.
+
+/**
+ * A request, as the bytes a server expects to read.
+ *
+ * Three headers are this function's rather than the caller's, and each is a
+ * correctness rule:
+ *
+ * - **`Host`** is required by HTTP/1.1 and a server may reject a request
+ *   without one. The caller usually has it; where it does not, the address the
+ *   server is listening on is the honest answer.
+ * - **`Content-Length`** is counted from the body handed over, never copied
+ *   from the caller. A length that disagrees with the bytes is how a server
+ *   comes to block waiting for a body that already ended.
+ * - **`Connection: close`** because this is one exchange. The server is told
+ *   so up front rather than discovering it, which is what lets a response with
+ *   no length of its own be read to the end.
+ *
+ * `Transfer-Encoding` is dropped for the same reason `Content-Length` is
+ * recomputed: the body here is already whole, so a chunked framing the caller
+ * inherited from somewhere else would describe bytes that are not on the wire.
+ */
+export function serializeRequestHead({ method = 'GET', target = '/', headers = [], host = null, contentLength = 0 }) {
+  const out = [`${method} ${target} HTTP/1.1`];
+  let sawHost = false;
+  for (const [name, value] of headers) {
+    const lower = name.toLowerCase();
+    if (lower === 'content-length' || lower === 'connection' || lower === 'transfer-encoding'
+      || lower === 'keep-alive') continue;
+    if (lower === 'host') sawHost = true;
+    out.push(`${name}: ${value}`);
+  }
+  if (!sawHost && host) out.splice(1, 0, `Host: ${host}`);
+  out.push(`Content-Length: ${contentLength}`);
+  out.push('Connection: close');
+  return ENC.encode(`${out.join('\r\n')}\r\n\r\n`);
+}
+
+/** Split a status line and headers. The mirror of {@link parseHead}. */
+function parseStatus(text) {
+  const lines = text.split('\r\n');
+  const start = lines.shift() || '';
+  const match = /^HTTP\/(\d)\.(\d) (\d{3})(?: (.*))?$/.exec(start);
+  if (!match) return null;
+
+  const headers = [];
+  for (const line of lines) {
+    if (!line) continue;
+    if (line[0] === ' ' || line[0] === '\t') {
+      if (!headers.length) return null;
+      headers[headers.length - 1][1] += ` ${line.trim()}`;
+      continue;
+    }
+    const colon = line.indexOf(':');
+    if (colon < 1) return null;
+    headers.push([line.slice(0, colon), line.slice(colon + 1).trim()]);
+  }
+  return { status: Number(match[3]), statusText: match[4] || '', headers };
+}
+
+/** Statuses that carry no body at all, whatever the headers claim. */
+const BODILESS = new Set([204, 304]);
+
+/**
+ * A parser over one server's byte stream.
+ *
+ * Stateful for the same reason the request parser is: a guest writes whatever
+ * it happens to `write(2)`, and the thing that knows where it got to has to be
+ * the parser.
+ *
+ * **A response can end three ways and all three are here**, because which one
+ * applies is the server's choice and not ours:
+ *
+ * - `Content-Length` — exact, and the common case.
+ * - `Transfer-Encoding: chunked` — decoded, because a server we do not control
+ *   is free to stream and a parser that only understood the other two would
+ *   truncate it at the first chunk header.
+ * - Neither — the body runs to the close, which HTTP/1.1 allows and which is
+ *   what `php -S` does for dynamic output. `finish()` is how that end arrives:
+ *   nothing in the byte stream announces it, so the caller has to.
+ */
+export function createResponseParser() {
+  let buf = new Uint8Array(2048);
+  let len = 0;
+  let head = null;
+  let mode = null;              // 'length' | 'chunked' | 'close'
+  let needed = 0;
+  let chunkLeft = 0;
+  let sawTerminator = false;
+  const body = [];
+  let bodyLen = 0;
+
+  const grow = (extra) => {
+    if (len + extra <= buf.length) return;
+    let size = buf.length;
+    while (size < len + extra) size *= 2;
+    const next = new Uint8Array(size);
+    next.set(buf.subarray(0, len));
+    buf = next;
+  };
+  const consume = (upto) => { buf.copyWithin(0, upto, len); len -= upto; };
+  const keep = (bytes) => { if (bytes.length) { body.push(bytes); bodyLen += bytes.length; } };
+
+  const joined = () => {
+    const out = new Uint8Array(bodyLen);
+    let at = 0;
+    for (const part of body) { out.set(part, at); at += part.length; }
+    return out;
+  };
+
+  const done = () => ({ ...head, body: joined() });
+
+  /** One CRLF-terminated line from the front of the buffer, or null. */
+  const line = () => {
+    for (let i = 1; i < len; i++) {
+      if (buf[i] === LF && buf[i - 1] === CR) {
+        const text = DEC.decode(buf.subarray(0, i - 1));
+        consume(i + 1);
+        return text;
+      }
+    }
+    return null;
+  };
+
+  return {
+    push(bytes) {
+      grow(bytes.length);
+      buf.set(bytes, len);
+      len += bytes.length;
+      return this.take();
+    },
+
+    take() {
+      if (!head) {
+        const end = endOfHead(buf, len);
+        if (end < 0) return null;
+        const parsed = parseStatus(DEC.decode(buf.subarray(0, end - 2)));
+        consume(end);
+        if (!parsed) return { error: MALFORMED };
+        head = parsed;
+        const encoding = (headerValue(parsed.headers, 'transfer-encoding') || '').toLowerCase();
+        const length = headerValue(parsed.headers, 'content-length');
+        if (BODILESS.has(parsed.status) || parsed.status < 200) { mode = 'length'; needed = 0; }
+        else if (encoding.includes('chunked')) { mode = 'chunked'; }
+        else if (length !== null) {
+          needed = Number(length);
+          if (!Number.isFinite(needed) || needed < 0) return { error: MALFORMED };
+          mode = 'length';
+        } else { mode = 'close'; }
+      }
+
+      if (mode === 'length') {
+        const take = Math.min(len, needed - bodyLen);
+        if (take > 0) { keep(buf.slice(0, take)); consume(take); }
+        return bodyLen >= needed ? done() : null;
+      }
+
+      if (mode === 'chunked') {
+        for (;;) {
+          if (chunkLeft > 0) {
+            const take = Math.min(len, chunkLeft);
+            if (!take) return null;
+            keep(buf.slice(0, take));
+            consume(take);
+            chunkLeft -= take;
+            continue;
+          }
+          // Between chunks: a bare CRLF closes the one just read, then a size.
+          const text = line();
+          if (text === null) return null;
+          if (text === '') continue;                      // the trailing CRLF
+          if (sawTerminator) continue;                    // trailers, ignored
+          const size = parseInt(text.split(';')[0], 16);
+          if (!Number.isFinite(size) || size < 0) return { error: MALFORMED };
+          if (size === 0) { sawTerminator = true; return done(); }
+          chunkLeft = size;
+        }
+      }
+
+      // 'close': everything is body until somebody says it ended.
+      if (len) { keep(buf.slice(0, len)); consume(len); }
+      return null;
+    },
+
+    /**
+     * The connection ended. Returns the response if that was a legal way for it
+     * to end, and an error if the server stopped mid-promise.
+     */
+    finish() {
+      if (!head) return len ? { error: MALFORMED } : null;
+      if (mode === 'close') return done();
+      if (mode === 'length' && bodyLen >= needed) return done();
+      return { error: 'the server closed before the response was complete' };
+    },
+  };
+}

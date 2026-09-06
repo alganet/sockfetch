@@ -52,7 +52,21 @@ export function wasiNet(net) {
     },
     poll(handle) { return net.poll(handle); },
     close(handle) { return net.close(handle); },
+
+    // The inbound half. `accept` hands back an ordinary handle, so the four
+    // verbs above already serve an accepted connection and there is nothing
+    // else to map — which is the whole point of it being a handle.
+    listen(address, port_) { return net.listen(address, port_); },
+    accept(handle) { return net.accept(handle); },
   };
+
+  // Only where the embedder gave the net a way to block. The shim reads the
+  // method's presence as "a poll on this net can park", and one that could not
+  // actually wait would turn every accept loop into a spin — which is exactly
+  // the failure it exists to prevent.
+  if (typeof net.wait === 'function') {
+    port.wait = (ms) => net.wait(ms);
+  }
 
   // Only where there is something to await. A shim reads the method's presence
   // as "this guest may suspend on a socket", so offering one that cannot
