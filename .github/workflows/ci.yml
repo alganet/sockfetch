@@ -1,0 +1,118 @@
+# SPDX-FileCopyrightText: 2026 Alexandre Gomes Gaigalas <alganet@gmail.com>
+#
+# SPDX-License-Identifier: ISC
+
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+# Superseded PR pushes are worth cancelling; a main run is not.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test on node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    # The suite is half a minute of mostly-sleeping timers; a job still sitting
+    # there at ten has hung, and hanging is the failure mode this package is
+    # about — a guest parked in Atomics.wait on an answer nobody owes it.
+    timeout-minutes: 10
+    strategy:
+      # 20 is what `engines` promises, and the promise is the point: the
+      # package has no build step, so what ships is what runs here.
+      fail-fast: false
+      matrix:
+        node: [ '20', '22', '24' ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # No install step, and nothing is missing: the package has no
+      # dependencies and no devDependencies, so `npm test` is node's own
+      # runner over test/*.test.mjs and nothing third-party is ever fetched.
+      # The package job below fails if that stops being true.
+      #
+      # The suites do reach the network, but only their own: backend.test.mjs
+      # stands up a server on 127.0.0.1 and fetches it. Every other host in
+      # here is a .test name against a stub, so an offline runner is fine.
+      - name: Test
+        run: npm test
+
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # `files` is ["src"] and `exports` names twelve paths inside it, which is
+      # two lists nothing keeps in step: a renamed file leaves an export
+      # pointing at nothing, and the suite would not notice, because the suite
+      # imports by relative path. So this resolves each subpath the way a
+      # consumer does — `import('sockfetch/codec')`, through the exports map,
+      # which node honours from inside the package itself — and checks first
+      # that npm actually packs the file it lands on.
+      #
+      # fetcher.worker.mjs is named but not imported: it is a worker entry
+      # point, and its last lines call parentPort.postMessage on import, so
+      # loading it on the main thread throws by design. The atomics suite
+      # spawns it for real.
+      - name: Verify exports and package contents
+        run: |
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            import { execSync } from "node:child_process";
+
+            const pkg = JSON.parse(readFileSync("package.json", "utf8"));
+            const packed = new Set(JSON.parse(
+              execSync("npm pack --dry-run --json", { encoding: "utf8" }))[0]
+              .files.map((f) => f.path));
+
+            let bad = 0;
+            const fail = (m) => { console.log(`::error::${m}`); bad += 1; };
+
+            for (const [sub, path] of Object.entries(pkg.exports)) {
+              if (!packed.has(path.replace(/^\.\//, ""))) {
+                fail(`exports "${sub}" points at ${path}, which npm does not pack`);
+                continue;
+              }
+              if (sub === "./package.json" || sub === "./fetcher.worker.mjs") continue;
+              const spec = sub === "." ? pkg.name : `${pkg.name}/${sub.slice(2)}`;
+              try {
+                await import(spec);
+              } catch (err) {
+                fail(`import("${spec}") fails: ${err.message}`);
+              }
+            }
+
+            if (Object.keys(pkg.dependencies ?? {}).length) {
+              fail("a dependency appeared; no job installs one, so it would not be there");
+            }
+
+            console.log(`checked ${Object.keys(pkg.exports).length} exports`);
+            process.exit(bad ? 1 : 0);
+          '
+
+      - name: Show what would be published
+        run: npm pack --dry-run
